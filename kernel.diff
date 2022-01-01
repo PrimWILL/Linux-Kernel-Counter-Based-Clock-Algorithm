@@ -1,0 +1,533 @@
+diff --git a/Makefile b/Makefile
+index 759e68a02..63f3cef3f 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1115,7 +1115,7 @@ export MODORDER := $(extmod_prefix)modules.order
+ export MODULES_NSDEPS := $(extmod_prefix)modules.nsdeps
+ 
+ ifeq ($(KBUILD_EXTMOD),)
+-core-y		+= kernel/ certs/ mm/ fs/ ipc/ security/ crypto/ block/
++core-y		+= kernel/ certs/ mm/ fs/ ipc/ security/ crypto/ block/ mm_syscall/ clock_syscall/
+ 
+ vmlinux-dirs	:= $(patsubst %/,%,$(filter %/, \
+ 		     $(core-y) $(core-m) $(drivers-y) $(drivers-m) \
+diff --git a/arch/x86/entry/syscalls/syscall_64.tbl b/arch/x86/entry/syscalls/syscall_64.tbl
+index dc9a76a20..e170f04e2 100644
+--- a/arch/x86/entry/syscalls/syscall_64.tbl
++++ b/arch/x86/entry/syscalls/syscall_64.tbl
+@@ -414,5 +414,8 @@
+ 546	x32	preadv2			compat_sys_preadv64v2
+ 547	x32	pwritev2		compat_sys_pwritev64v2
+ 
++
++548	64	mm_syscall      sys_mm_syscall
++549	64	clock_syscall      sys_clock_syscall
+ # This is the end of the legacy x32 range.  Numbers 548 and above are
+ # not special and are not to be used for x32-specific syscalls.
+diff --git a/clock_syscall/Makefile b/clock_syscall/Makefile
+new file mode 100644
+index 000000000..3ba4332b9
+--- /dev/null
++++ b/clock_syscall/Makefile
+@@ -0,0 +1 @@
++obj-y += my_clock_sys.o
+diff --git a/clock_syscall/my_clock_sys.c b/clock_syscall/my_clock_sys.c
+new file mode 100644
+index 000000000..d84dea0d0
+--- /dev/null
++++ b/clock_syscall/my_clock_sys.c
+@@ -0,0 +1,149 @@
++/* Start of mm_sys.c */
++#include <linux/kernel.h>
++#include <linux/syscalls.h>
++#include <linux/mm.h>
++#include <linux/rmap.h>
++#include <linux/list.h>
++#include <linux/cpuset.h>
++#include <linux/percpu-defs.h>
++#include <linux/vm_event_item.h>
++#include <linux/memcontrol.h>
++#include <linux/swap.h>
++#include <linux/timer.h>
++#include <linux/page_ref.h>
++
++#define DELAY (3 * HZ)
++
++void func(void);
++
++struct timer_data {
++    int value;
++    spinlock_t lock;
++    struct timer_list timer;
++    bool isActive;
++};
++
++struct timer_data my_data = {};
++
++void timer_callback(struct timer_list *timer) {
++    struct timer_data *data = from_timer(data, timer, timer);
++
++    data->value++;
++    spin_lock(&data->lock);
++    if (data->isActive){
++        mod_timer(timer, jiffies + DELAY);
++        func();
++    }
++    spin_unlock(&data->lock);
++}
++
++void func(void){
++    struct pglist_data *current_pglist = NULL;
++    struct lruvec *lruvec = NULL;
++    struct mem_cgroup *memcg = NULL;
++    struct list_head *src;
++    int ref_count = 0;
++    int i;
++    struct page *p = NULL;
++    unsigned long vm_flags;
++
++    for (i = 0; i < MAX_NUMNODES; i++) {
++        if (NODE_DATA(i) == NULL) 
++            continue;
++        
++        current_pglist = NODE_DATA(i);
++
++        if (current_pglist->node_present_pages == 0) {
++            printk(KERN_ALERT "Node-%d does not have any pages.\n", i);
++            continue;
++        }
++
++        pgdat_resize_lock(current_pglist, 0);
++
++        memcg = get_mem_cgroup_from_mm(NULL);
++        lruvec = mem_cgroup_lruvec(memcg, current_pglist);
++
++        /* 모든 page 순회 */
++
++        // 1. LRU_ACTIVE_FILE
++        src = &lruvec->lists[LRU_ACTIVE_FILE];
++
++        if (list_empty(src)) return;
++        list_for_each_entry(p, src, lru) {
++            /* counter에 reference bit 더하기 */
++
++            ref_count = page_referenced(p, 1, memcg, &vm_flags);
++            if (ref_count > 0) {
++                p->counter += ref_count;  
++                /* reference bit 초기화 */
++                ClearPageReferenced(p); 
++            }
++
++            /* counter 값 최댓값 초과 확인 */
++            if(p->counter>100) p->counter = 100;
++        }
++
++        // 2. LRU_INACTIVE_FILE
++        src = &lruvec->lists[LRU_INACTIVE_FILE];
++    
++        if (list_empty(src)) return;
++        list_for_each_entry(p, src, lru) {
++            ref_count = page_referenced(p, 1, memcg, &vm_flags);
++            if (ref_count > 0) {
++                p->counter += ref_count;  
++                /* reference bit 초기화 */
++                ClearPageReferenced(p);
++            }
++            /* counter 값 최댓값 초과 확인 */
++            if(p->counter>100) p->counter = 100;
++        }
++
++        // 3. LRU_ACTIVE_ANON
++        src = &lruvec->lists[LRU_ACTIVE_ANON];
++
++        if (list_empty(src)) return;
++        list_for_each_entry(p, src, lru) {
++            ref_count = page_referenced(p, 1, memcg, &vm_flags);
++            if (ref_count > 0) {
++                p->counter += ref_count;  
++
++                /* reference bit 초기화 */
++                ClearPageReferenced(p); 
++            }
++
++            /* counter 값 최댓값 초과 확인 */
++            if(p->counter>100) p->counter = 100;
++        }
++
++        // 4. LRU_INACTIVE_ANON
++        src = &lruvec->lists[LRU_INACTIVE_ANON];
++
++        if (list_empty(src)) return;
++        list_for_each_entry(p, src, lru) {
++            ref_count = page_referenced(p, 1, memcg, &vm_flags);
++            if (ref_count > 0) {
++                p->counter += ref_count; 
++                /* reference bit 초기화 */
++                ClearPageReferenced(p); 
++            }
++
++            /* counter 값 최댓값 초과 확인 */
++            if(p->counter>100) p->counter = 100;
++        }
++        pgdat_resize_unlock(current_pglist, 0);
++    }
++}
++
++SYSCALL_DEFINE0(clock_syscall)
++{
++
++   printk("[%s] creating timer...\n", __func__);
++
++   /* initialization */
++   my_data.isActive = true;
++   spin_lock_init(&my_data.lock);
++   timer_setup(&my_data.timer, timer_callback, 0);
++   mod_timer(&my_data.timer, jiffies + DELAY);
++
++   return 0;
++}
+\ No newline at end of file
+diff --git a/include/linux/mm_types.h b/include/linux/mm_types.h
+index 7f8ee09c7..27462433d 100644
+--- a/include/linux/mm_types.h
++++ b/include/linux/mm_types.h
+@@ -237,6 +237,9 @@ struct page {
+ #ifdef LAST_CPUPID_NOT_IN_PAGE_FLAGS
+ 	int _last_cpupid;
+ #endif
++
++	// add for count reference num
++	int counter;
+ } _struct_page_alignment;
+ 
+ static inline atomic_t *compound_mapcount_ptr(struct page *page)
+diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
+index 1699bd52d..db00a7531 100644
+--- a/include/linux/syscalls.h
++++ b/include/linux/syscalls.h
+@@ -1273,6 +1273,8 @@ asmlinkage long sys_old_mmap(struct mmap_arg_struct __user *arg);
+ asmlinkage long sys_ni_syscall(void);
+ 
+ /* Add your new system call function */
++asmlinkage long sys_mm_syscall(void);
++asmlinkage long sys_clock_syscall(void);
+ 
+ #endif /* CONFIG_ARCH_HAS_SYSCALL_WRAPPER */
+ 
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 74296c2d1..04a15c4b7 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -3595,46 +3595,123 @@ static bool throttle_direct_reclaim(gfp_t gfp_mask, struct zonelist *zonelist,
+ }
+ 
+ unsigned long try_to_free_pages(struct zonelist *zonelist, int order,
+-				gfp_t gfp_mask, nodemask_t *nodemask)
++            gfp_t gfp_mask, nodemask_t *nodemask)
+ {
+-	unsigned long nr_reclaimed;
+-	struct scan_control sc = {
+-		.nr_to_reclaim = SWAP_CLUSTER_MAX,
+-		.gfp_mask = current_gfp_context(gfp_mask),
+-		.reclaim_idx = gfp_zone(gfp_mask),
+-		.order = order,
+-		.nodemask = nodemask,
+-		.priority = DEF_PRIORITY,
+-		.may_writepage = !laptop_mode,
+-		.may_unmap = 1,
+-		.may_swap = 1,
+-	};
+-
+-	/*
+-	 * scan_control uses s8 fields for order, priority, and reclaim_idx.
+-	 * Confirm they are large enough for max values.
+-	 */
+-	BUILD_BUG_ON(MAX_ORDER > S8_MAX);
+-	BUILD_BUG_ON(DEF_PRIORITY > S8_MAX);
+-	BUILD_BUG_ON(MAX_NR_ZONES > S8_MAX);
+-
+-	/*
+-	 * Do not enter reclaim if fatal signal was delivered while throttled.
+-	 * 1 is returned so that the page allocator does not OOM kill at this
+-	 * point.
+-	 */
+-	if (throttle_direct_reclaim(sc.gfp_mask, zonelist, nodemask))
+-		return 1;
+-
+-	set_task_reclaim_state(current, &sc.reclaim_state);
+-	trace_mm_vmscan_direct_reclaim_begin(order, sc.gfp_mask);
+-
+-	nr_reclaimed = do_try_to_free_pages(zonelist, &sc);
+-
+-	trace_mm_vmscan_direct_reclaim_end(nr_reclaimed);
+-	set_task_reclaim_state(current, NULL);
+-
+-	return nr_reclaimed;
++   unsigned long nr_reclaimed;
++   struct scan_control sc = {
++      .nr_to_reclaim = SWAP_CLUSTER_MAX,
++      .gfp_mask = current_gfp_context(gfp_mask),
++      .reclaim_idx = gfp_zone(gfp_mask),
++      .order = order,
++      .nodemask = nodemask,
++      .priority = DEF_PRIORITY,
++      .may_writepage = !laptop_mode,
++      .may_unmap = 1,
++      .may_swap = 1,
++   };
++   /* revise start */
++   pg_data_t *last_pgdat;
++   struct zoneref *z;
++   struct zone *zone;
++   struct list_head *src;
++   struct page *p = NULL;
++   LIST_HEAD(free_pages);
++   /* revise end */
++
++   /*
++    * scan_control uses s8 fields for order, priority, and reclaim_idx.
++    * Confirm they are large enough for max values.
++    */
++   BUILD_BUG_ON(MAX_ORDER > S8_MAX);
++   BUILD_BUG_ON(DEF_PRIORITY > S8_MAX);
++   BUILD_BUG_ON(MAX_NR_ZONES > S8_MAX);
++
++   /*
++    * Do not enter reclaim if fatal signal was delivered while throttled.
++    * 1 is returned so that the page allocator does not OOM kill at this
++    * point.
++    */
++   if (throttle_direct_reclaim(sc.gfp_mask, zonelist, nodemask))
++      return 1;
++
++   set_task_reclaim_state(current, &sc.reclaim_state);
++   trace_mm_vmscan_direct_reclaim_begin(order, sc.gfp_mask);
++
++   /* revise start */
++   // nr_reclaimed = do_try_to_free_pages(zonelist, &sc);
++   last_pgdat = NULL;
++   for_each_zone_zonelist_nodemask(zone, z, zonelist, sc.reclaim_idx,
++               sc.nodemask) {
++      if (zone->zone_pgdat == last_pgdat)
++         continue;
++      last_pgdat = zone->zone_pgdat;
++
++      snapshot_refaults(sc.target_mem_cgroup, zone->zone_pgdat);
++
++      if (cgroup_reclaim(&sc)) {
++         struct lruvec *lruvec;
++
++         lruvec = mem_cgroup_lruvec(sc.target_mem_cgroup,
++                     zone->zone_pgdat);
++         /* LRU_ACTIVE_FILE */
++         list_for_each_entry(p, &lruvec->lists[LRU_ACTIVE_FILE], lru) {
++            if (p->counter == 0) {
++               /* evict this page: active to inactive */
++               list_move_tail(&p->lru, &lruvec->lists[LRU_INACTIVE_FILE]);
++            }
++            else {
++               p->counter--;
++               list_move_tail(&p->lru, &lruvec->lists[LRU_ACTIVE_FILE]);
++            }
++         }
++         /* LRU_INACTIVE_FILE */
++         list_for_each_entry(p, &lruvec->lists[LRU_INACTIVE_FILE], lru) {
++            if (p->counter == 0) {
++               /* evict this page: free page */
++               list_move_tail(&p->lru, &free_pages);
++            }
++            else {
++               p->counter--;
++               list_move_tail(&p->lru, &lruvec->lists[LRU_INACTIVE_FILE]);
++            }
++         }
++         /* LRU_ACTIVE_ANON */
++         list_for_each_entry(p, &lruvec->lists[LRU_ACTIVE_ANON], lru) {
++            if (p->counter == 0) {
++               /* evict this page: active to inactive */
++               list_move_tail(&p->lru, &lruvec->lists[LRU_INACTIVE_ANON]);
++            }
++            else {
++               p->counter--;
++               list_move_tail(&p->lru, &lruvec->lists[LRU_ACTIVE_ANON]);
++            }
++         }
++         /* LRU_INACTIVE_ANON */
++         list_for_each_entry(p, &lruvec->lists[LRU_INACTIVE_ANON], lru) {
++            if (p->counter == 0) {
++               /* evict this page: free page */
++               list_move_tail(&p->lru, &free_pages);
++            }
++            else {
++               p->counter--;
++               list_move_tail(&p->lru, &lruvec->lists[LRU_INACTIVE_ANON]);
++            }
++         }
++      }
++   }
++
++   mem_cgroup_uncharge_list(&free_pages);
++   try_to_unmap_flush();
++   free_unref_page_list(&free_pages);
++   /* revise end */
++
++   trace_mm_vmscan_direct_reclaim_end(nr_reclaimed);
++   set_task_reclaim_state(current, NULL);
++
++   /* revise start */
++   // return nr_reclaimed;
++   return 0;
++   /* revise end */
+ }
+ 
+ #ifdef CONFIG_MEMCG
+diff --git a/mm_syscall/Makefile b/mm_syscall/Makefile
+new file mode 100644
+index 000000000..85ffd655c
+--- /dev/null
++++ b/mm_syscall/Makefile
+@@ -0,0 +1 @@
++obj-y += my_mm_sys.o
+diff --git a/mm_syscall/my_mm_sys.c b/mm_syscall/my_mm_sys.c
+new file mode 100644
+index 000000000..60b37b03e
+--- /dev/null
++++ b/mm_syscall/my_mm_sys.c
+@@ -0,0 +1,136 @@
++/* Start of mm_sys.c */
++#include <linux/kernel.h>
++#include <linux/syscalls.h>
++#include <linux/mm.h>
++#include <linux/rmap.h>
++#include <linux/list.h>
++#include <linux/cpuset.h>
++#include <linux/percpu-defs.h>
++#include <linux/vm_event_item.h>
++#include <linux/memcontrol.h>
++#include <linux/swap.h>
++
++int get_pfn(struct list_head *src)
++{
++	int page_count = 0;
++	struct page *p = NULL;
++
++	if (list_empty(src)) return 0;
++	list_for_each_entry(p, src, lru) {
++		page_count++;
++	}
++	return page_count;
++}
++
++int get_ref_count(struct list_head *src, struct mem_cgroup *memcg)
++{
++	int ref_count = 0;
++	struct page *p = NULL;
++	unsigned long vm_flags;
++
++	if (list_empty(src)) return 0;
++	list_for_each_entry(p, src, lru) {
++		if (page_referenced(p, 1, memcg, &vm_flags) > 0) {
++			ref_count++;
++		}
++	}
++	return ref_count;
++}
++
++int get_demo_promo_count(int category)
++{
++	if (category == 0)
++		return this_cpu_read(vm_event_states.event[PGACTIVATE]);
++	else if (category == 1)
++		return this_cpu_read(vm_event_states.event[PGDEACTIVATE]);
++	else
++		return -1;
++}
++
++int get_evicted_page_count(int category)
++{
++	if (category == 0)
++		return this_cpu_read(vm_event_states.event[PGSTEAL_ANON]);
++	else if (category == 1)
++		return this_cpu_read(vm_event_states.event[PGSTEAL_FILE]);
++	else
++		return -1;
++}
++
++SYSCALL_DEFINE0(mm_syscall)
++{
++	struct pglist_data *current_pglist = NULL;
++	struct lruvec *lruvec = NULL;
++	struct mem_cgroup *memcg = NULL;
++	struct mem_cgroup_per_node *mz;
++	int i;
++
++	for (i = 0; i < MAX_NUMNODES; i++) {
++		if (NODE_DATA(i) == NULL) 
++			continue;
++		
++		current_pglist = NODE_DATA(i);
++
++
++		if (current_pglist->node_present_pages == 0) {
++			printk(KERN_ALERT "Node-%d does not have any pages.\n", i);
++			continue;
++		}
++
++		pgdat_resize_lock(current_pglist, 0);
++
++		memcg = get_mem_cgroup_from_mm(NULL);
++		lruvec = mem_cgroup_lruvec(memcg, current_pglist);
++
++		printk(KERN_INFO "The current number of pages in the current LRU page lists\n"); 
++		printk(KERN_INFO "LRU_ACTIVE_FILE: %d\n", get_pfn(&lruvec->lists[LRU_ACTIVE_FILE])); 
++		printk(KERN_INFO "LRU_INACTIVE_FILE: %d\n", get_pfn(&lruvec->lists[LRU_INACTIVE_FILE])); 
++		printk(KERN_INFO "LRU_ACTIVE_ANON: %d\n", get_pfn(&lruvec->lists[LRU_ACTIVE_ANON])); 
++		printk(KERN_INFO "LRU_INACTIVE_ANON: %d\n", get_pfn(&lruvec->lists[LRU_INACTIVE_ANON])); 
++
++		pgdat_resize_unlock(current_pglist, 0);
++
++		printk(KERN_INFO "===================================================================================\n"); 
++
++		pgdat_resize_lock(current_pglist, 0);
++
++		memcg = get_mem_cgroup_from_mm(NULL);
++		lruvec = mem_cgroup_lruvec(memcg, current_pglist);
++
++		printk(KERN_INFO "The current number of pages those reference bits are set in active/inactive list\n"); 
++		printk(KERN_INFO "LRU_ACTIVE_FILE: %d\n", get_ref_count(&lruvec->lists[LRU_ACTIVE_FILE], memcg)); 
++		printk(KERN_INFO "LRU_INACTIVE_FILE: %d\n", get_ref_count(&lruvec->lists[LRU_INACTIVE_FILE], memcg)); 
++		printk(KERN_INFO "LRU_ACTIVE_ANON: %d\n", get_ref_count(&lruvec->lists[LRU_ACTIVE_ANON], memcg)); 
++		printk(KERN_INFO "LRU_INACTIVE_ANON: %d\n", get_ref_count(&lruvec->lists[LRU_INACTIVE_ANON], memcg)); 
++
++		pgdat_resize_unlock(current_pglist, 0);
++
++		printk(KERN_INFO "===================================================================================\n"); 
++
++		pgdat_resize_lock(current_pglist, 0);
++
++		memcg = get_mem_cgroup_from_mm(NULL);
++		lruvec = mem_cgroup_lruvec(memcg, current_pglist);
++
++		printk(KERN_INFO "The cumulative number of pages moved from active list to inactive list and vice versa\n"); 
++		printk(KERN_INFO "Active to inactive: %d\n", get_demo_promo_count(1)); 
++		printk(KERN_INFO "Inactive to active: %d\n", get_demo_promo_count(0)); 
++
++		pgdat_resize_unlock(current_pglist, 0);
++
++		printk(KERN_INFO "===================================================================================\n"); 
++
++		pgdat_resize_lock(current_pglist, 0);
++
++		memcg = get_mem_cgroup_from_mm(NULL);
++		lruvec = mem_cgroup_lruvec(memcg, current_pglist);
++
++		printk(KERN_INFO "The cumulative number of pages evicted from inactive list\n"); 
++		printk(KERN_INFO "Evicted pages(ANON): %d\n", get_evicted_page_count(0)); 
++		printk(KERN_INFO "Evicted pages(FILE): %d\n", get_evicted_page_count(1)); 
++
++		pgdat_resize_unlock(current_pglist, 0);
++	}
++
++	return 0;
++}
+\ No newline at end of file
